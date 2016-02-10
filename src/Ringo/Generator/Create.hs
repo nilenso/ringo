@@ -1,52 +1,97 @@
-module Ringo.Generator.Create (tableDefnSQL, factTableDefnSQL) where
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
 
-import Control.Monad.Reader (Reader, asks)
-import Data.Monoid          ((<>))
-import Data.Text            (Text)
+module Ringo.Generator.Create (dimensionTableDefnSQL, factTableDefnSQL) where
+
+#if MIN_VERSION_base(4,8,0)
+#else
+import Control.Applicative ((<$>))
+#endif
+
+import Control.Monad.Reader     (Reader, asks, withReader)
+import Database.HsSqlPpp.Syntax ( Statement(..), RowConstraint(..), AlterTableAction(..)
+                                , AlterTableOperation(..), Constraint(..), Cascade(..) )
+import Data.Maybe               (listToMaybe, maybeToList)
+import Data.Monoid              ((<>))
+import Data.Text                (Text)
 
 import Ringo.Extractor.Internal
-import Ringo.Generator.Internal
+import Ringo.Generator.Sql
 import Ringo.Types
 import Ringo.Utils
 
-tableDefnSQL :: Table -> [Text]
-tableDefnSQL Table {..} =
-  tableSQL : concatMap constraintDefnSQL tableConstraints
-  where
-    columnDefnSQL Column {..} =
-      columnName <> " " <> columnType <> " " <> nullableDefnSQL columnNullable
+tableDefnStmts :: Table -> Reader Env [Statement]
+tableDefnStmts Table {..} = withReader envView $ do
+  Settings {..} <- asks envSettings
+  let tabName  = tableName <> settingTableNameSuffixTemplate
 
-    nullableDefnSQL Null    = "NULL"
-    nullableDefnSQL NotNull = "NOT NULL"
+      tableSQL = CreateTable ea (name tabName) (map columnDefnSQL tableColumns) [] Nothing
 
-    tableSQL = "CREATE TABLE " <> tableName <> " (\n"
-                 <> (joinColumnNames . map columnDefnSQL $ tableColumns)
-                 <> "\n)"
+      columnDefnSQL Column {..} =
+        attDef columnName columnType $ nullableDefnSQL columnNullable
 
-    constraintDefnSQL constraint =
-      let alterTableSQL = "ALTER TABLE ONLY " <> tableName <> " ADD "
-      in case constraint of
-        PrimaryKey cName -> [ alterTableSQL <> "PRIMARY KEY (" <> cName <> ")" ]
-        ForeignKey oTableName cNamePairs ->
-          [ alterTableSQL <> "FOREIGN KEY (" <> joinColumnNames (map fst cNamePairs) <> ") REFERENCES "
-              <> oTableName <> " (" <> joinColumnNames (map snd cNamePairs) <> ")" ]
-        UniqueKey cNames -> ["CREATE UNIQUE INDEX ON " <> tableName <> " (" <> joinColumnNames cNames <> ")"]
+      nullableDefnSQL Null    = NullConstraint ea ""
+      nullableDefnSQL NotNull = NotNullConstraint ea ""
 
+      constraintDefnSQL constraint =
+        let constr = case constraint of
+              PrimaryKey cName -> PrimaryKeyConstraint ea "" [nmc cName]
+              ForeignKey oTableName cNamePairs ->
+                ReferenceConstraint ea "" (map (nmc . fst) cNamePairs)
+                  (name oTableName) (map (nmc . snd) cNamePairs) Restrict Restrict
+              UniqueKey cNames -> UniqueConstraint ea "" $ map nmc cNames
+
+        in AlterTable ea (name tabName) $ AlterTableActions ea [AddConstraint ea constr]
+
+  return $ tableSQL : map constraintDefnSQL tableConstraints
+
+tableDefnSQL :: Table -> (Table -> Reader Env [Statement]) -> Reader Env [Text]
+tableDefnSQL table indexFn = do
+  ds <- map ppStatement <$> tableDefnStmts table
+  is <- map (\st -> ppStatement st <> ";\n") <$> indexFn table
+  return $ ds ++ is
+
+dimensionTableDefnSQL :: Table -> Reader Env [Text]
+dimensionTableDefnSQL table = tableDefnSQL table dimensionTableIndexStmts
+
+dimensionTableIndexStmts :: Table -> Reader Env [Statement]
+dimensionTableIndexStmts Table {..} = withReader envView $do
+  Settings {..} <- asks envSettings
+  let tabName        = tableName <> settingTableNameSuffixTemplate
+      tablePKColName = head [ cName | PrimaryKey cName <- tableConstraints ]
+      nonPKColNames  = [ cName | Column cName _ _ <- tableColumns, cName /= tablePKColName ]
+
+  return [ CreateIndexTSQL ea (nmc "") (name tabName) [nmc cName]
+           | cName <- nonPKColNames, length nonPKColNames > 1 ]
 
 factTableDefnSQL :: Fact -> Table -> Reader Env [Text]
-factTableDefnSQL fact table = do
-  Settings {..} <- asks envSettings
-  allDims       <- extractAllDimensionTables fact
+factTableDefnSQL fact table = tableDefnSQL table (factTableIndexStmts fact)
 
-  let factCols  = forMaybe (factColumns fact) $ \col -> case col of
-        DimTime cName -> Just $ timeUnitColumnName settingDimTableIdColumnName cName settingTimeUnit
-        NoDimId cName -> Just cName
-        _             -> Nothing
+factTableIndexStmts :: Fact -> Table -> Reader Env [Statement]
+factTableIndexStmts fact table = do
+  allDims <- extractAllDimensionTables fact
+  withReader envView $ do
+    Settings {..} <- asks envSettings
+    tables        <- asks envTables
 
-      dimCols   = [ factDimFKIdColumnName settingDimPrefix settingDimTableIdColumnName tableName
-                    | (_, Table {..}) <- allDims ]
+    let dimTimeCol           = head [ cName | DimTimeV cName <- factColumns fact ]
+        tenantIdCol          = listToMaybe [ cName | TenantIdV cName <- factColumns fact ]
+        tabName              = tableName table <> settingTableNameSuffixTemplate
+        dimTimeColName cName = timeUnitColumnName settingDimTableIdColumnName cName settingTimeUnit
 
-      indexSQLs = [ "CREATE INDEX ON " <> tableName table <> " USING btree (" <> col <> ")"
-                    | col <- factCols ++ dimCols ]
+        factCols = forMaybe (factColumns fact) $ \FactColumn {factColTargetColumn = cName, ..} ->
+          case factColType of
+            DimTime   -> Just [dimTimeColName cName]
+            NoDimId   -> Just [cName]
+            TenantId  -> Just [cName]
+            _               -> Nothing
 
-  return $ tableDefnSQL table ++ indexSQLs
+        dimCols  = [ [ factDimFKIdColumnName settingDimPrefix settingDimTableIdColumnName dimFact dimTable tables ]
+                     | (dimFact, dimTable) <- allDims ]
+
+    return [ CreateIndexTSQL ea (nmc "") (name tabName) (map nmc cols)
+             | cols <- factCols ++ dimCols ++ [ [cName, dimTimeColName dimTimeCol]
+                                                         | cName <- maybeToList tenantIdCol ] ]

@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 module Ringo.ArgParser (ProgArgs(..), parseArgs) where
 
 import qualified Data.Text as Text
@@ -66,6 +68,14 @@ settingsParser = let Settings {..} = defSettings
      <*> minorOption "dimensions-json-file"
                      settingDimensionJSONFileName
                      "Name of the output dimensions json file"
+     <*> option auto (long "foreign-key-id-coalesce-val"
+                      <> hidden
+                      <> value settingForeignKeyIdCoalesceValue
+                      <> showDefault
+                      <> help "Value to coalease missing foriegn key ids to, in fact tables")
+     <*> minorOption "tablename-suffix-template"
+                     settingTableNameSuffixTemplate
+                     "Suffix template for table names in SQL"
   where
     minorOption longDesc defValue helpTxt =
       Text.pack <$> strOption (long longDesc

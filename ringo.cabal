@@ -22,18 +22,20 @@ library
                        Ringo.Validator,
                        Ringo.Extractor.Internal,
                        Ringo.Generator.Internal,
+                       Ringo.Generator.Sql,
                        Ringo.Generator.Create,
                        Ringo.Generator.Populate.Dimension,
                        Ringo.Generator.Populate.Fact,
+                       Ringo.Types.Internal,
                        Ringo.Utils
   build-depends:       base           >=4.7 && <5,
                        text           >=1.2 && <1.3,
                        containers     >=0.5 && <0.6,
                        mtl            >=2.1 && <2.3,
-                       raw-strings-qq >= 1.0 && <1.2
-  ghc-options:         -Wall -fno-warn-unused-do-bind -funbox-strict-fields -fno-warn-orphans -O2
-  default-extensions:  OverloadedStrings, RecordWildCards, ScopedTypeVariables, BangPatterns,
-                       TupleSections, CPP, NamedFieldPuns
+                       raw-strings-qq >=1.0 && <1.2,
+                       hssqlppp       ==0.5.23
+  ghc-options:         -Wall -Werror -fwarn-incomplete-uni-patterns -fno-warn-unused-do-bind
+                       -fno-warn-orphans -funbox-strict-fields -O2
   default-language:    Haskell2010
 
 executable ringo
@@ -45,24 +47,28 @@ executable ringo
                        text                 >=1.2     && <1.3,
                        bytestring           >=0.10    && <0.11,
                        containers           >=0.5     && <0.6,
-                       optparse-applicative >=0.11    && <0.12,
+                       optparse-applicative >=0.11    && <0.13,
                        yaml                 >=0.8.11  && <0.9,
-                       vector               >=0.10    && <0.11,
+                       vector               >=0.10    && <0.12,
                        directory            >=1.2     && <1.3,
                        filepath             >=1.3     && <1.5,
-                       aeson                >=0.8     && <0.9,
+                       aeson                >=0.8     && <0.11,
                        ringo
-  ghc-options:         -Wall -fno-warn-unused-do-bind -funbox-strict-fields -fno-warn-orphans -O2
-  default-extensions:  OverloadedStrings, RecordWildCards, ScopedTypeVariables, BangPatterns,
-                       TupleSections, CPP, NamedFieldPuns
+  ghc-options:         -Wall -Werror -fwarn-incomplete-uni-patterns -fno-warn-unused-do-bind
+                       -fno-warn-orphans -funbox-strict-fields -O2
   default-language:    Haskell2010
 
 test-suite ringo-test
   type:                exitcode-stdio-1.0
-  hs-source-dirs:      test
-  main-is:             Spec.hs
-  build-depends:       base
-                     , ringo
+  hs-source-dirs:      test, src
+  main-is:             doctests.hs
+  if impl(ghc >= 7.10)
+    build-depends:       base
+                       , ringo
+                       , pretty-show >=1.6 && <1.7
+                       , doctest     >=0.9 && <0.11
+  else
+    buildable: False
   default-language:    Haskell2010
 
 source-repository head

@@ -1,3 +1,8 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE GADTs #-}
 module Ringo.Extractor.Internal where
 
 import qualified Data.Map  as Map
@@ -8,15 +13,23 @@ import qualified Data.Text as Text
 import Control.Applicative  ((<$>))
 #endif
 
-import Control.Monad.Reader (Reader, asks)
+import Control.Monad.Reader (Reader, asks, withReader)
 import Data.Function        (on)
 import Data.Maybe           (mapMaybe, fromMaybe, fromJust, catMaybes)
 import Data.Monoid          ((<>))
-import Data.List            (nub, nubBy)
+import Data.List            (nub, nubBy, find)
 import Data.Text            (Text)
 
 import Ringo.Types
-import Ringo.Utils
+
+findTable :: TableName -> [Table] -> Maybe Table
+findTable tName = find ((== tName) . tableName)
+
+findFact :: TableName -> [Fact] -> Maybe Fact
+findFact fName = find ((== fName) . factName)
+
+findColumn :: ColumnName -> [Column] -> Maybe Column
+findColumn cName = find ((== cName) . columnName)
 
 dimColumnName :: Text -> ColumnName -> ColumnName
 dimColumnName dimName columnName =
@@ -26,9 +39,13 @@ timeUnitColumnName :: Text -> ColumnName -> TimeUnit -> ColumnName
 timeUnitColumnName dimIdColName colName timeUnit =
   colName <> "_" <> timeUnitName timeUnit <> "_" <> dimIdColName
 
-factDimFKIdColumnName :: Text -> Text -> TableName -> ColumnName
-factDimFKIdColumnName dimPrefix dimIdColName dimTableName =
-  fromMaybe dimTableName (Text.stripPrefix dimPrefix dimTableName) <> "_" <> dimIdColName
+factDimFKIdColumnName :: Text -> Text -> Fact -> Table -> [Table] -> ColumnName
+factDimFKIdColumnName dimPrefix dimIdColName dimFact dimTable@Table { .. } tables =
+  if dimTable `elem` tables
+    then head [ factColTargetColumn
+                | FactColumn {factColType = DimId {..}, ..} <- factColumns dimFact
+                , factColTargetTable == tableName ]
+    else fromMaybe tableName (Text.stripPrefix dimPrefix tableName) <> "_" <> dimIdColName
 
 extractedFactTableName :: Text -> Text -> TableName -> TimeUnit -> TableName
 extractedFactTableName factPrefix factInfix factName timeUnit =
@@ -42,13 +59,15 @@ idColTypeToFKIdColType typ = case Text.toLower typ of
   _             -> typ
 
 extractDimensionTables :: Fact -> Reader Env [Table]
-extractDimensionTables fact = do
+extractDimensionTables fact = withReader envView $ do
   settings  <- asks envSettings
   tables    <- asks envTables
   let table = fromJust . findTable (factTableName fact) $ tables
   return $ dimsFromIds tables ++ dimsFromVals settings (tableColumns table)
   where
-    dimsFromIds tables = catMaybes [ findTable d tables | DimId d _ <- factColumns fact ]
+    dimsFromIds tables =
+      catMaybes [ findTable factColTargetTable tables
+                  | FactColumn {factColType = DimId {..}} <- factColumns fact ]
 
     dimsFromVals Settings {..} tableColumns =
       map (\(dim, cols) ->
@@ -67,9 +86,9 @@ extractDimensionTables fact = do
                     . nub)
       . Map.fromListWith (flip (++))
       . mapMaybe (\fcol -> do
-                    DimVal d col <- fcol
-                    column       <- findColumn col tableColumns
-                    return (d, [ column ]))
+                    FactColumn {factColType = DimVal {..}, ..} <- fcol
+                    column <- findColumn factColTargetColumn tableColumns
+                    return (factColTargetTable, [ column ]))
       . map Just
       . factColumns
       $ fact
@@ -80,4 +99,5 @@ extractAllDimensionTables fact = do
   parentDims <- concat <$> mapM extract (factParentNames fact)
   return . nubBy ((==) `on` snd) $ myDims ++ parentDims
   where
-    extract fName = asks envFacts >>= extractAllDimensionTables . fromJust . findFact fName
+    extract fName =
+      asks (envFacts . envView) >>= extractAllDimensionTables . fromJust . findFact fName
